@@ -37,7 +37,7 @@ The current YAML provides:
 - Optional ESPHome web server
 - Optional Bluetooth proxy
 
-Packet type 5 is currently received and CRC-validated but is **not yet decoded into a rain-rate entity**.
+
 
 ---
 
@@ -256,7 +256,7 @@ The current decoder handles the following Davis packet types:
 | Type | Measurement |
 |---:|---|
 | 4 | UV index |
-| 5 | Rain-tip timing / rain-rate related packet — received but not yet published |
+| 5 | Rain rate / seconds between bucket tips |
 | 6 | Solar radiation |
 | 8 | Outdoor temperature |
 | 9 | Wind gust |
@@ -280,10 +280,43 @@ The YAML creates these main entities:
 | Davis Wind Direction | Degrees + compass direction |
 | Davis Solar Radiation | Solar radiation |
 | Davis UV Index | UV index |
-| Davis Daily Rain | Rain accumulator |
+| Davis Daily Rain | Rain accumulator since ESP boot |
+| Davis Rain Rate | Instantaneous tipping-bucket rain rate in mm/h |
 | Davis Battery Low | ISS battery-low flag |
 | Davis RSSI | RF signal strength |
 | Davis LQI | CC1101 link-quality indicator |
+
+---
+
+# Rain rate (Type 5)
+
+Davis packet Type 5 carries the timing used to derive instantaneous tipping-bucket rain rate.
+
+The decoder reconstructs the number of seconds between / since bucket tips from bytes 3 and 4. For the metric Davis 0.2 mm tipping bucket:
+
+```text
+rain_rate_mm_h = 720 / rain_seconds
+```
+
+Examples:
+
+| Tip interval | Rain rate |
+|---:|---:|
+| 30 s | 24.00 mm/h |
+| 60 s | 12.00 mm/h |
+| 120 s | 6.00 mm/h |
+| 300 s | 2.40 mm/h |
+| 600 s | 1.20 mm/h |
+| 900 s | 0.80 mm/h |
+| >= 1020 s | 0.00 mm/h |
+
+The resulting Home Assistant entity is:
+
+```text
+sensor.davis_rain_rate
+```
+
+This is an instantaneous/extrapolated tipping-bucket rate, not a rolling hourly rainfall total. Type 14 remains the source for accumulated rainfall.
 
 ---
 
@@ -307,6 +340,18 @@ The global is initialized as:
 
 It is not persisted across reboot and there is no midnight reset in the YAML.
 
+For a true calendar-day rainfall total, create a Home Assistant Utility Meter from `sensor.davis_daily_rain` with a daily cycle and `periodically_resetting: true`:
+
+```yaml
+utility_meter:
+  davis_rain_today:
+    source: sensor.davis_daily_rain
+    name: Davis Rain Today
+    cycle: daily
+    periodically_resetting: true
+    always_available: true
+```
+
 For a true daily rainfall value, it is recommended to either:
 
 - create the daily total in Home Assistant from a monotonic rain counter, or
@@ -319,61 +364,6 @@ The decoder currently assumes:
 ```
 
 and uses the rolling 7-bit Davis rain-tip counter.
-
-The cleanest way is to let ESPHome provide the running rain total since its boot, and let Home Assistant turn that into a persistent, midnight-resetting daily total using a Utility Meter.
-
-Your ESP source can reset whenever the ESP reboots; Home Assistant's Utility Meter explicitly supports periodically resetting source sensors and retains its own value across HA restarts.
-
-Create it in Home Assistant
-
-Go to Settings → Devices & services → Helpers → Create helper → Utility Meter and use:
-
-Setting	Value
-Name	Davis Rain Today
-Input sensor	Davis Daily Rain
-Meter reset cycle	Daily
-Meter reset offset	0
-Delta values	OFF
-Periodically resetting	ON
-Net consumption	OFF
-Sensor always available	ON
-
-Periodically resetting = ON is important because the ESPHome rain accumulator goes back to 0 whenever the ESP32 reboots. Home Assistant will recognize that reset rather than interpreting it as negative rainfall.
-
-If you prefer YAML, the equivalent is:
-
-utility_meter:
-  davis_rain_today:
-    source: sensor.davis_daily_rain
-    name: Davis Rain Today
-    cycle: daily
-    periodically_resetting: true
-    always_available: true
-
-After restarting Home Assistant you'll get approximately:
-
-sensor.davis_rain_today
-
-This will behave as the real calendar-day total:
-
-00:00       0.0 mm
-07:20       tip → 0.2 mm
-07:45       tip → 0.4 mm
-
-ESP reboots
-ESP source → 0.0 mm
-HA daily   → still 0.4 mm
-
-09:10       next tip
-ESP source → 0.2 mm
-HA daily   → 0.6 mm
-
-midnight
-HA daily   → 0.0 mm
-
-The Utility Meter itself is persistent across Home Assistant restarts. The first day after creating it is necessarily incomplete if you create it part-way through the day; starting the following midnight it represents the complete calendar day.
-
-There is one remaining limitation in our ESPHome implementation: rain that physically falls while the ESP32 is offline can still be lost. On boot, it takes the first Davis Type-14 counter it sees as its new baseline rather than reconstructing tips that happened while it was down. The next improvement I recommend is changing ESPHome to expose the raw Davis 7-bit tip counter to HA as well. Then HA can preserve rainfall through ESP32 reboots much more robustly.
 
 ---
 
@@ -599,13 +589,24 @@ The exact best orientation depends on the installation.
 - Station ID 0 only unless timing/code is changed
 - Rain total resets when the ESP reboots
 - No automatic midnight rain reset
-- Packet type 5 rain-rate data is not yet exposed as an entity
 - No support yet for multiple Davis transmitters
 - Repeater behavior has not been extensively tested
 - This is a reverse-engineered receiver and is not an official Davis Instruments implementation
 
 ---
 
+# Suggested repository files
+
+A simple repository layout could be:
+
+```text
+.
+├── README.md
+├── davis_esphome_hopping_cc1101.yaml
+└── secrets.example.yaml
+```
+
+Do not publish your real `secrets.yaml`.
 
 ---
 
