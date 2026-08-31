@@ -1,0 +1,956 @@
+esphome:
+  name: esphome-web-4763f4
+  friendly_name: valkopohja_micro_1
+  min_version: 2025.11.0
+  name_add_mac_suffix: false
+
+esp32:
+  variant: esp32
+  framework:
+    type: esp-idf
+    advanced:
+      minimum_chip_revision: "3.1"
+      sram1_as_iram: true
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret esphome_web_4763f4__encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret OTA_password
+    allow_partition_access: false
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+bluetooth_proxy:
+  active: true
+  connection_slots: 1
+  
+web_server:
+  port: 80
+  version: 3
+
+spi:
+  - id: spi_1
+    clk_pin: GPIO18
+    miso_pin: GPIO19
+    mosi_pin: GPIO23
+
+globals:
+  - id: rain_count_prev
+    type: int
+    initial_value: '-1'
+
+  - id: rain_total_mm
+    type: float
+    initial_value: '0.0'
+
+  - id: raw_wind_dir
+    type: float
+    initial_value: '0.0'
+
+  # --------------------------------------------------
+  # Davis EU frequency hopping state
+  #
+  # Packet Station ID 0 = Davis transmitter ID 1.
+  # ID 1 transmits every 2.5625 seconds.
+  #
+  # Hop order used here:
+  #   0: 868.077250 MHz
+  #   1: 868.317250 MHz
+  #   2: 868.557250 MHz
+  #   3: 868.197250 MHz
+  #   4: 868.437250 MHz
+  # --------------------------------------------------
+
+  - id: davis_hop_index
+    type: int
+    initial_value: '1'
+
+  - id: davis_hop_locked
+    type: bool
+    initial_value: 'false'
+
+  - id: davis_next_expected_ms
+    type: uint32_t
+    initial_value: '0'
+
+  - id: davis_missed_hops
+    type: int
+    initial_value: '0'
+
+  # --------------------------------------------------
+  # Per-hop reception statistics
+  # --------------------------------------------------
+
+  - id: davis_hop_valid_total
+    type: uint32_t[5]
+    initial_value: '{0, 0, 0, 0, 0}'
+
+  - id: davis_hop_missed_total
+    type: uint32_t[5]
+    initial_value: '{0, 0, 0, 0, 0}'
+
+  - id: davis_hop_valid_window
+    type: uint32_t[5]
+    initial_value: '{0, 0, 0, 0, 0}'
+
+  - id: davis_hop_missed_window
+    type: uint32_t[5]
+    initial_value: '{0, 0, 0, 0, 0}'
+
+  - id: davis_hop_crc_bad_total
+    type: uint32_t[5]
+    initial_value: '{0, 0, 0, 0, 0}'
+
+  - id: davis_hop_crc_bad_window
+    type: uint32_t[5]
+    initial_value: '{0, 0, 0, 0, 0}'
+
+cc1101:
+  - id: cc1101_1
+    spi_id: spi_1
+
+    cs_pin: GPIO5
+    gdo0_pin: GPIO4
+
+    # Davis Vantage Pro2 / Vue EU
+    #
+    # Start acquisition on hop index 1 (868.317250 MHz).
+    # After the first CRC-valid Station 0 packet, the code below
+    # follows the five-channel Davis EU hopping sequence. CRC-bad
+    # frames are counted for diagnostics but do not change hop state.
+    frequency: 868.317250MHz
+    modulation_type: GFSK
+    symbol_rate: 19200
+    fsk_deviation: 9.5kHz
+    filter_bandwidth: 102kHz
+    magn_target: 33dB
+
+    packet_mode: true
+    packet_length: 10
+
+    sync_mode: 16/16
+    sync1: 0xCB
+    sync0: 0x89
+
+    crc_enable: false
+    whitening: false
+    num_preamble: 2
+
+    on_packet:
+      then:
+        - lambda: |
+            if (x.size() < 10)
+              return;
+
+            // --------------------------------------------------
+            // Raw CC1101 diagnostic BEFORE Davis CRC checking
+            // --------------------------------------------------
+
+            ESP_LOGD(
+              "DAVIS_RF",
+              "RX hop %d: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X | offset %.0f Hz | RSSI %.1f | LQI %u",
+              id(davis_hop_index),
+              x[0], x[1], x[2], x[3],
+              x[4], x[5], x[6], x[7], x[8], x[9],
+              freq_offset,
+              rssi,
+              lqi
+            );
+
+            // --------------------------------------------------
+            // Davis bit reversal
+            // --------------------------------------------------
+
+            std::vector<uint8_t> d(10);
+
+            for (int i = 0; i < 10; i++) {
+
+              uint8_t b = x[i];
+
+              b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
+              b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
+              b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
+
+              d[i] = b;
+            }
+
+            // --------------------------------------------------
+            // Davis CRC / bit alignment
+            // --------------------------------------------------
+
+            bool crc_ok = false;
+
+            for (int shift = 0; shift < 3; shift++) {
+
+              uint16_t crc = 0;
+
+              for (int i = 0; i < 6; i++) {
+
+                crc ^= (uint16_t)d[i] << 8;
+
+                for (int j = 0; j < 8; j++) {
+
+                  crc = (crc & 0x8000)
+                      ? (crc << 1) ^ 0x1021
+                      : (crc << 1);
+                }
+              }
+
+              uint16_t received_crc_1 =
+                  ((uint16_t)d[6] << 8) | d[7];
+
+              uint16_t received_crc_2 =
+                  ((uint16_t)d[7] << 8) | d[6];
+
+              if (crc == received_crc_1 ||
+                  crc == received_crc_2) {
+
+                crc_ok = true;
+                break;
+              }
+
+              // Shift packet one bit
+              uint8_t carry = 0;
+
+              for (int i = 0; i < 10; i++) {
+
+                uint8_t next_carry =
+                    (d[i] & 0x01) << 7;
+
+                d[i] =
+                    (d[i] >> 1) | carry;
+
+                carry = next_carry;
+              }
+            }
+
+            // --------------------------------------------------
+            // CRC-bad packet handling
+            //
+            // The CC1101-specific Davis receiver only advances its
+            // tracked hop state after a CRC-valid packet. A bad CRC
+            // is useful diagnostically, but must NOT re-phase or
+            // advance the hopping sequence.
+            // --------------------------------------------------
+
+            if (!crc_ok) {
+
+              uint32_t candidate_ms = millis();
+
+              bool near_expected = false;
+
+              if (id(davis_hop_locked)) {
+
+                int32_t candidate_time_error =
+                    (int32_t)(candidate_ms - id(davis_next_expected_ms));
+
+                near_expected =
+                    (candidate_time_error >= -450 &&
+                     candidate_time_error <= 450);
+              }
+
+              // Count only strong, time-plausible CRC-bad frames as
+              // likely Davis transmissions. Do not alter hop state.
+              if (id(davis_hop_locked) &&
+                  near_expected &&
+                  rssi > -90.0f) {
+
+                int candidate_hop = id(davis_hop_index);
+
+                if (candidate_hop >= 0 && candidate_hop < 5) {
+                  id(davis_hop_crc_bad_total)[candidate_hop]++;
+                  id(davis_hop_crc_bad_window)[candidate_hop]++;
+                }
+              }
+
+              return;
+            }
+
+            // --------------------------------------------------
+            // Station ID
+            // --------------------------------------------------
+
+            uint8_t unit_id =
+                d[0] & 0x07;
+
+            bool battery_low =
+                (d[0] & 0x08) != 0;
+
+            // This installation uses Station ID 0.
+            // Ignore other Davis transmitters so that they cannot
+            // disturb the hopping synchronization.
+            if (unit_id != 0)
+              return;
+
+            // A direct ISS normally has FF FF in bytes 8/9.
+            // If not, either a repeater is involved or framing
+            // deserves another look.
+            if (d[8] != 0xFF || d[9] != 0xFF) {
+              ESP_LOGW(
+                "DAVIS",
+                "Valid packet has non-FF tail bytes: %02X %02X",
+                d[8],
+                d[9]
+              );
+            }
+
+            // --------------------------------------------------
+            // Per-hop statistics: successful reception
+            // --------------------------------------------------
+
+            int rx_hop = id(davis_hop_index);
+
+            if (rx_hop >= 0 && rx_hop < 5) {
+              id(davis_hop_valid_total)[rx_hop]++;
+              id(davis_hop_valid_window)[rx_hop]++;
+            }
+
+            // --------------------------------------------------
+            // Frequency-hop synchronization
+            // --------------------------------------------------
+
+            uint32_t packet_ms =
+                millis();
+
+            bool first_lock =
+                !id(davis_hop_locked);
+
+            id(davis_hop_locked) =
+                true;
+
+            id(davis_missed_hops) =
+                0;
+
+            // Station ID 0 / Davis transmitter ID 1:
+            // Davis transmitter ID 1 period is 2.5625 seconds.
+            // Millisecond timer uses 2563 ms; every received packet
+            // re-phases the timer and prevents accumulated drift.
+            id(davis_next_expected_ms) =
+                packet_ms + 2563;
+
+            if (first_lock) {
+              ESP_LOGI(
+                "DAVIS_HOP",
+                "LOCKED on hop %d; following Davis EU sequence",
+                id(davis_hop_index)
+              );
+            }
+
+            ESP_LOGI(
+              "DAVIS",
+              "VALID PACKET | Station ID: %u | Type: %u | RSSI: %.1f dBm | LQI: %u",
+              unit_id,
+              d[0] >> 4,
+              rssi,
+              lqi
+            );
+
+            // --------------------------------------------------
+            // Diagnostic values
+            // --------------------------------------------------
+
+            id(davis_battery_low)->publish_state(
+              battery_low
+            );
+
+            id(davis_rssi)->publish_state(
+              rssi
+            );
+
+            id(davis_lqi)->publish_state(
+              lqi
+            );
+
+            // --------------------------------------------------
+            // Wind speed
+            // --------------------------------------------------
+
+            float wind_ms =
+                d[1] * 0.44704f;
+
+            if (wind_ms >= 0.0f &&
+                wind_ms < 90.0f) {
+
+              id(davis_wind_speed)->publish_state(
+                wind_ms
+              );
+
+              if (std::isnan(
+                    id(davis_windgust).state)) {
+
+                id(davis_windgust)->publish_state(
+                  wind_ms
+                );
+              }
+            }
+
+            // --------------------------------------------------
+            // Wind direction
+            // --------------------------------------------------
+
+            float wind_dir =
+                d[2] * (360.0f / 255.0f);
+
+            if (wind_dir >= 0.0f &&
+                wind_dir <= 360.0f) {
+
+              id(raw_wind_dir) =
+                  wind_dir;
+
+              id(davis_wind_dir_combined)->update();
+            }
+
+            // --------------------------------------------------
+            // Packet type
+            // --------------------------------------------------
+
+            uint8_t ptype =
+                d[0] >> 4;
+
+            // --------------------------------------------------
+            // Type 8 = temperature
+            // --------------------------------------------------
+
+            if (ptype == 8) {
+
+              uint16_t raw =
+                  ((uint16_t)d[3] << 8) |
+                  d[4];
+
+              float temp_c =
+                  (raw / 160.0f - 32.0f)
+                  * 5.0f / 9.0f;
+
+              if (temp_c > -15.0f &&
+                  temp_c < 45.0f) {
+
+                id(davis_temp)->publish_state(
+                  temp_c
+                );
+
+                ESP_LOGI(
+                  "DAVIS",
+                  "Station %u | Temperature: %.1f °C",
+                  unit_id,
+                  temp_c
+                );
+              }
+            }
+
+            // --------------------------------------------------
+            // Type 9 = wind gust
+            // --------------------------------------------------
+
+            else if (ptype == 9) {
+
+              float gust_ms =
+                  d[3] * 0.44704f;
+
+              if (gust_ms >= 0.0f &&
+                  gust_ms < 90.0f) {
+
+                id(davis_windgust)->publish_state(
+                  gust_ms
+                );
+
+                ESP_LOGI(
+                  "DAVIS",
+                  "Station %u | Wind gust: %.1f m/s",
+                  unit_id,
+                  gust_ms
+                );
+              }
+            }
+
+            // --------------------------------------------------
+            // Type 10 = humidity
+            // --------------------------------------------------
+
+            else if (ptype == 10) {
+
+              uint16_t raw =
+                  ((d[4] & 0x30) << 4) |
+                  d[3];
+
+              float hum =
+                  raw / 10.0f;
+
+              if (hum > 0.0f &&
+                  hum <= 100.0f) {
+
+                id(davis_hum)->publish_state(
+                  hum
+                );
+
+                ESP_LOGI(
+                  "DAVIS",
+                  "Station %u | Humidity: %.0f %%",
+                  unit_id,
+                  hum
+                );
+              }
+            }
+
+            // --------------------------------------------------
+            // Type 6 = solar radiation
+            // --------------------------------------------------
+
+            else if (ptype == 6) {
+
+              uint16_t raw_solar =
+                  (((uint16_t)d[3] << 8) |
+                   d[4]) >> 6;
+
+              float solar =
+                  (float)raw_solar;
+
+              if (solar >= 0.0f &&
+                  solar <= 1800.0f) {
+
+                id(davis_solar_radiation)
+                  ->publish_state(solar);
+
+                ESP_LOGI(
+                  "DAVIS",
+                  "Station %u | Solar: %.0f W/m²",
+                  unit_id,
+                  solar
+                );
+              }
+            }
+
+            // --------------------------------------------------
+            // Type 4 = UV Index
+            // --------------------------------------------------
+
+            else if (ptype == 4) {
+
+              uint16_t raw_uv =
+                  (((uint16_t)d[3] << 8) |
+                   d[4]) >> 6;
+
+              float uv_index =
+                  raw_uv / 50.0f;
+
+              if (uv_index >= 0.0f &&
+                  uv_index <= 20.0f) {
+
+                id(davis_uv_index)
+                  ->publish_state(uv_index);
+
+                ESP_LOGI(
+                  "DAVIS",
+                  "Station %u | UV index: %.1f",
+                  unit_id,
+                  uv_index
+                );
+              }
+            }
+
+            // --------------------------------------------------
+            // Type 14 = rain
+            // --------------------------------------------------
+
+            else if (ptype == 14) {
+
+              int tips =
+                  d[3] & 0x7F;
+
+              if (id(rain_count_prev) >= 0) {
+
+                int delta =
+                    tips -
+                    id(rain_count_prev);
+
+                if (delta < 0)
+                  delta += 128;
+
+                if (delta > 0 &&
+                    delta < 10) {
+
+                  id(rain_total_mm) +=
+                      delta * 0.2f;
+
+                  id(davis_rain)
+                    ->publish_state(
+                      id(rain_total_mm)
+                    );
+
+                  ESP_LOGI(
+                    "DAVIS",
+                    "Station %u | Rain: %.1f mm",
+                    unit_id,
+                    id(rain_total_mm)
+                  );
+                }
+              }
+
+              id(rain_count_prev) =
+                  tips;
+            }
+
+            // --------------------------------------------------
+            // Diagnostic packet dump
+            // --------------------------------------------------
+
+            ESP_LOGD(
+              "DAVIS",
+              "VALID RAW: %02X %02X %02X %02X %02X %02X %02X %02X | Station %u | Type %u | RSSI %.1f | LQI %u",
+              d[0],
+              d[1],
+              d[2],
+              d[3],
+              d[4],
+              d[5],
+              d[6],
+              d[7],
+              unit_id,
+              ptype,
+              rssi,
+              lqi
+            );
+
+            // --------------------------------------------------
+            // Hop immediately to the frequency of the NEXT packet
+            // --------------------------------------------------
+
+            static const float davis_freqs_hz[5] = {
+              868077250.0f,
+              868317250.0f,
+              868557250.0f,
+              868197250.0f,
+              868437250.0f
+            };
+
+            id(davis_hop_index) =
+                (id(davis_hop_index) + 1) % 5;
+
+            float next_freq =
+                davis_freqs_hz[id(davis_hop_index)];
+
+            id(cc1101_1).set_frequency(
+                next_freq
+            );
+
+            ESP_LOGD(
+              "DAVIS_HOP",
+              "Valid packet -> hop %d, %.6f MHz; next packet expected in ~2.555 s",
+              id(davis_hop_index),
+              next_freq / 1000000.0f
+            );
+
+# --------------------------------------------------
+# Missed-packet hopping watchdog
+#
+# After a valid packet we are already tuned to the next hop.
+# If that packet does not arrive, wait until 200 ms after its
+# expected time and advance one more channel.
+#
+# After 25 consecutive misses, abandon timing lock and return
+# to the acquisition frequency (868.317250 MHz).
+# --------------------------------------------------
+
+interval:
+  - interval: 25ms
+    then:
+      - lambda: |-
+          if (!id(davis_hop_locked))
+            return;
+
+          uint32_t now =
+              millis();
+
+          uint32_t deadline =
+              id(davis_next_expected_ms) + 200;
+
+          // Signed subtraction makes this safe across millis() wraparound.
+          if ((int32_t)(now - deadline) < 0)
+            return;
+
+          static const float davis_freqs_hz[5] = {
+            868077250.0f,
+            868317250.0f,
+            868557250.0f,
+            868197250.0f,
+            868437250.0f
+          };
+
+          // --------------------------------------------------
+          // Per-hop statistics: missed reception
+          // --------------------------------------------------
+
+          int missed_hop = id(davis_hop_index);
+
+          if (missed_hop >= 0 && missed_hop < 5) {
+            id(davis_hop_missed_total)[missed_hop]++;
+            id(davis_hop_missed_window)[missed_hop]++;
+          }
+
+          id(davis_missed_hops)++;
+
+          if (id(davis_missed_hops) >= 25) {
+
+            id(davis_hop_locked) =
+                false;
+
+            id(davis_hop_index) =
+                1;
+
+            id(davis_next_expected_ms) =
+                0;
+
+            id(cc1101_1).set_frequency(
+                davis_freqs_hz[1]
+            );
+
+            ESP_LOGW(
+              "DAVIS_HOP",
+              "Lost synchronization after 25 misses; back to acquisition at %.6f MHz",
+              davis_freqs_hz[1] / 1000000.0f
+            );
+
+            return;
+          }
+
+          id(davis_hop_index) =
+              (id(davis_hop_index) + 1) % 5;
+
+          float next_freq =
+              davis_freqs_hz[id(davis_hop_index)];
+
+          id(cc1101_1).set_frequency(
+              next_freq
+          );
+
+          // Keep the original transmitter timebase instead of
+          // starting a new period from this late hop.
+          id(davis_next_expected_ms) +=
+              2563;
+
+          ESP_LOGW(
+            "DAVIS_HOP",
+            "Missed packet #%d -> hop %d, %.6f MHz",
+            id(davis_missed_hops),
+            id(davis_hop_index),
+            next_freq / 1000000.0f
+          );
+
+
+  # --------------------------------------------------
+  # Davis hop reception statistics
+  #
+  # ok   = CRC-valid Davis packets
+  # crc  = strong sync-qualified packets with bad CRC
+  # miss = no usable packet detected in the receive window
+  # --------------------------------------------------
+
+  - interval: 60s
+    then:
+      - lambda: |-
+          static const float freqs_mhz[5] = {
+            868.077250f,
+            868.317250f,
+            868.557250f,
+            868.197250f,
+            868.437250f
+          };
+
+          uint32_t w_ok_all = 0;
+          uint32_t w_crc_all = 0;
+          uint32_t w_miss_all = 0;
+          uint32_t t_ok_all = 0;
+          uint32_t t_crc_all = 0;
+          uint32_t t_miss_all = 0;
+
+          for (int i = 0; i < 5; i++) {
+            uint32_t w_ok = id(davis_hop_valid_window)[i];
+            uint32_t w_crc = id(davis_hop_crc_bad_window)[i];
+            uint32_t w_miss = id(davis_hop_missed_window)[i];
+            uint32_t w_exp = w_ok + w_crc + w_miss;
+
+            uint32_t t_ok = id(davis_hop_valid_total)[i];
+            uint32_t t_crc = id(davis_hop_crc_bad_total)[i];
+            uint32_t t_miss = id(davis_hop_missed_total)[i];
+            uint32_t t_exp = t_ok + t_crc + t_miss;
+
+            float w_pct = w_exp > 0
+                ? 100.0f * w_ok / w_exp : 0.0f;
+            float t_pct = t_exp > 0
+                ? 100.0f * t_ok / t_exp : 0.0f;
+
+            ESP_LOGI(
+              "DAVIS_STATS",
+              "H%d %.6f | 60s ok %u/%u %.0f%% crc %u miss %u | boot ok %u/%u %.1f%% crc %u miss %u",
+              i, freqs_mhz[i],
+              w_ok, w_exp, w_pct, w_crc, w_miss,
+              t_ok, t_exp, t_pct, t_crc, t_miss
+            );
+
+            w_ok_all += w_ok;
+            w_crc_all += w_crc;
+            w_miss_all += w_miss;
+            t_ok_all += t_ok;
+            t_crc_all += t_crc;
+            t_miss_all += t_miss;
+
+            id(davis_hop_valid_window)[i] = 0;
+            id(davis_hop_crc_bad_window)[i] = 0;
+            id(davis_hop_missed_window)[i] = 0;
+          }
+
+          uint32_t w_exp_all = w_ok_all + w_crc_all + w_miss_all;
+          uint32_t t_exp_all = t_ok_all + t_crc_all + t_miss_all;
+
+          float w_pct_all = w_exp_all > 0
+              ? 100.0f * w_ok_all / w_exp_all : 0.0f;
+          float t_pct_all = t_exp_all > 0
+              ? 100.0f * t_ok_all / t_exp_all : 0.0f;
+
+          ESP_LOGI(
+            "DAVIS_STATS",
+            "ALL | 60s ok %u/%u %.1f%% crc %u miss %u | boot ok %u/%u %.1f%% crc %u miss %u",
+            w_ok_all, w_exp_all, w_pct_all, w_crc_all, w_miss_all,
+            t_ok_all, t_exp_all, t_pct_all, t_crc_all, t_miss_all
+          );
+
+binary_sensor:
+
+  - platform: template
+    name: "Davis Battery Low"
+    id: davis_battery_low
+    update_interval: never
+    device_class: battery
+
+sensor:
+
+  - platform: wifi_signal
+    name: micro_valkopohja1_wifi_signal
+    id: sensor_wifi_signal_1
+
+  - platform: template
+    name: "Davis Temperature"
+    id: davis_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    name: "Davis Humidity"
+    id: davis_hum
+    unit_of_measurement: "%"
+    device_class: humidity
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    name: "Davis Wind Speed"
+    id: davis_wind_speed
+    unit_of_measurement: "m/s"
+    device_class: wind_speed
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+
+  - platform: template
+    name: "Davis Wind Gust"
+    id: davis_windgust
+    unit_of_measurement: "m/s"
+    device_class: wind_speed
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    name: "Davis Solar Radiation"
+    id: davis_solar_radiation
+    unit_of_measurement: "W/m²"
+    icon: "mdi:solar-power"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    name: "Davis UV Index"
+    id: davis_uv_index
+    unit_of_measurement: "UV index"
+    icon: "mdi:weather-sunny"
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    name: "Davis Daily Rain"
+    id: davis_rain
+    unit_of_measurement: "mm"
+    device_class: precipitation
+    state_class: total_increasing
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    name: "Davis RSSI"
+    id: davis_rssi
+    unit_of_measurement: "dBm"
+    device_class: signal_strength
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    name: "Davis LQI"
+    id: davis_lqi
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: never
+
+text_sensor:
+
+  - platform: template
+    name: "Davis Wind Direction"
+    id: davis_wind_dir_combined
+    icon: "mdi:compass-outline"
+    update_interval: never
+
+    lambda: |-
+      float deg =
+          id(raw_wind_dir);
+
+      int index =
+          int((deg + 11.25f) / 22.5f) % 16;
+
+      const char* compassPoints[] = {
+        "N", "NNE", "NE", "ENE",
+        "E", "ESE", "SE", "SSE",
+        "S", "SSW", "SW", "WSW",
+        "W", "WNW", "NW", "NNW"
+      };
+
+      char buffer[32];
+
+      snprintf(
+        buffer,
+        sizeof(buffer),
+        "%.0f° %s",
+        deg,
+        compassPoints[index]
+      );
+
+      return std::string(buffer);
