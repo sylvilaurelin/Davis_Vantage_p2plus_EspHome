@@ -320,6 +320,61 @@ The decoder currently assumes:
 
 and uses the rolling 7-bit Davis rain-tip counter.
 
+The cleanest way is to let ESPHome provide the running rain total since its boot, and let Home Assistant turn that into a persistent, midnight-resetting daily total using a Utility Meter.
+
+Your ESP source can reset whenever the ESP reboots; Home Assistant's Utility Meter explicitly supports periodically resetting source sensors and retains its own value across HA restarts.
+
+Create it in Home Assistant
+
+Go to Settings → Devices & services → Helpers → Create helper → Utility Meter and use:
+
+Setting	Value
+Name	Davis Rain Today
+Input sensor	Davis Daily Rain
+Meter reset cycle	Daily
+Meter reset offset	0
+Delta values	OFF
+Periodically resetting	ON
+Net consumption	OFF
+Sensor always available	ON
+
+Periodically resetting = ON is important because the ESPHome rain accumulator goes back to 0 whenever the ESP32 reboots. Home Assistant will recognize that reset rather than interpreting it as negative rainfall.
+
+If you prefer YAML, the equivalent is:
+
+utility_meter:
+  davis_rain_today:
+    source: sensor.davis_daily_rain
+    name: Davis Rain Today
+    cycle: daily
+    periodically_resetting: true
+    always_available: true
+
+After restarting Home Assistant you'll get approximately:
+
+sensor.davis_rain_today
+
+This will behave as the real calendar-day total:
+
+00:00       0.0 mm
+07:20       tip → 0.2 mm
+07:45       tip → 0.4 mm
+
+ESP reboots
+ESP source → 0.0 mm
+HA daily   → still 0.4 mm
+
+09:10       next tip
+ESP source → 0.2 mm
+HA daily   → 0.6 mm
+
+midnight
+HA daily   → 0.0 mm
+
+The Utility Meter itself is persistent across Home Assistant restarts. The first day after creating it is necessarily incomplete if you create it part-way through the day; starting the following midnight it represents the complete calendar day.
+
+There is one remaining limitation in our ESPHome implementation: rain that physically falls while the ESP32 is offline can still be lost. On boot, it takes the first Davis Type-14 counter it sees as its new baseline rather than reconstructing tips that happened while it was down. The next improvement I recommend is changing ESPHome to expose the raw Davis 7-bit tip counter to HA as well. Then HA can preserve rainfall through ESP32 reboots much more robustly.
+
 ---
 
 # Reception statistics
